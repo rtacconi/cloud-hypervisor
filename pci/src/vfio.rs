@@ -2277,6 +2277,37 @@ impl VfioPciDevice {
         self.iommu_attached
     }
 
+    /// Returns true if the region's sparse mmap areas stay clear of the
+    /// MSI-X table, so mapping them still traps every table access.
+    ///
+    /// A VFIO driver that cannot let the table be mapped publishes such
+    /// areas instead of MSIX_MAPPABLE. vfio-pci did so before Linux 4.16,
+    /// and NVIDIA's vGPU driver does so for BAR0 of a vGPU. The areas may
+    /// cover the PBA, as vfio-pci's did. The driver may reject any other
+    /// mapping, so the areas are checked rather than trimmed.
+    fn sparse_mmap_excludes_msix_table(
+        caps: &[VfioRegionInfoCap],
+        region_index: u32,
+        msix_cap: &MsixCap,
+    ) -> bool {
+        let Some(areas) = caps.iter().find_map(|cap| match cap {
+            VfioRegionInfoCap::SparseMmap(sparse_mmap) => Some(&sparse_mmap.areas),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if region_index != msix_cap.table_bir() {
+            return true;
+        }
+
+        let (table_offset, table_size) = msix_cap.table_range();
+        let table_start = align_page_size_down(table_offset);
+        let table_end = align_page_size_up(table_offset + table_size);
+        areas
+            .iter()
+            .all(|area| area.offset + area.size <= table_start || area.offset >= table_end)
+    }
+
     fn generate_sparse_areas(
         caps: &[VfioRegionInfoCap],
         region_index: u32,
@@ -2423,11 +2454,13 @@ impl VfioPciDevice {
                 };
 
                 // Don't try to mmap the region if it contains MSI-X table or
-                // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
-                // in the list of supported capabilities.
+                // MSI-X PBA subregion, unless the kernel advertises
+                // MSIX_MAPPABLE or publishes sparse mmap areas that leave the
+                // MSI-X table out.
                 if let Some(msix) = self.common.interrupt.msix.as_ref()
                     && (region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir())
                     && !caps.contains(&VfioRegionInfoCap::MsixMappable)
+                    && !Self::sparse_mmap_excludes_msix_table(&caps, region.index, &msix.cap)
                 {
                     continue;
                 }
@@ -3069,6 +3102,7 @@ mod tests {
     use std::os::fd::AsFd;
     use std::sync::Mutex;
 
+    use vfio_ioctls::VfioRegionInfoCapSparseMmap;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -3123,6 +3157,60 @@ mod tests {
                 },
             ],
         }]
+    }
+
+    fn sparse_mmap_caps(areas: &[(u64, u64)]) -> Vec<VfioRegionInfoCap> {
+        vec![VfioRegionInfoCap::SparseMmap(VfioRegionInfoCapSparseMmap {
+            areas: areas
+                .iter()
+                .map(|&(offset, size)| VfioRegionSparseMmapArea { offset, size })
+                .collect(),
+        })]
+    }
+
+    #[test]
+    fn sparse_mmap_around_msix_table_is_mapped() {
+        // BAR0 of an NVIDIA A2-4C vGPU: three vectors, the table at
+        // 0x10000 and the PBA at 0x20000, inside the second area.
+        let msix_cap = MsixCap::new(0, 3, 0x10000, 0, 0x20000);
+        let caps = sparse_mmap_caps(&[(0, 0xf000), (0x11000, 0x2f000)]);
+
+        assert!(VfioPciDevice::sparse_mmap_excludes_msix_table(
+            &caps, 0, &msix_cap
+        ));
+    }
+
+    #[test]
+    fn sparse_mmap_over_msix_table_is_not_mapped() {
+        let msix_cap = MsixCap::new(0, 3, 0x10000, 0, 0x20000);
+
+        let whole_bar = sparse_mmap_caps(&[(0, 0x40000)]);
+        assert!(!VfioPciDevice::sparse_mmap_excludes_msix_table(
+            &whole_bar, 0, &msix_cap
+        ));
+
+        let table_page = sparse_mmap_caps(&[(0, 0xf000), (0x10000, 0x30000)]);
+        assert!(!VfioPciDevice::sparse_mmap_excludes_msix_table(
+            &table_page,
+            0,
+            &msix_cap
+        ));
+
+        assert!(!VfioPciDevice::sparse_mmap_excludes_msix_table(
+            &[],
+            0,
+            &msix_cap
+        ));
+    }
+
+    #[test]
+    fn sparse_mmap_of_pba_only_bar_is_mapped() {
+        let msix_cap = MsixCap::new(0, 3, 0x10000, 2, 0);
+        let caps = sparse_mmap_caps(&[(0, 0x1000)]);
+
+        assert!(VfioPciDevice::sparse_mmap_excludes_msix_table(
+            &caps, 2, &msix_cap
+        ));
     }
 
     #[test]
