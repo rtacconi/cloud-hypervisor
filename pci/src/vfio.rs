@@ -973,7 +973,7 @@ impl VfioCommon {
         // Going through all regular regions to compute the BAR size.
         // We're not saving the BAR address to restore it, because we
         // are going to allocate a guest address for each BAR and write
-        // that new address back.
+        // that new address back, to our configuration and to the device.
         while bar_id < VFIO_PCI_CONFIG_REGION_INDEX {
             let mut region_size: u64 = 0;
             let mut region_type = PciBarRegionType::Memory32BitRegion;
@@ -1160,12 +1160,40 @@ impl VfioCommon {
                 user_memory_regions: Vec::new(),
             });
 
+            // vfio-pci virtualizes BARs and ignores this write. A vendor
+            // driver that emulates the config space, such as NVIDIA's vGPU
+            // driver, takes the BAR register as the guest's BAR base and
+            // would otherwise keep the all-ones value of the sizing write.
+            self.write_bar_to_device(bar_id, bar_addr.raw_value(), region_type, flags);
+
             bar_id += 1;
             if region_type == PciBarRegionType::Memory64BitRegion {
                 bar_id += 1;
             }
         }
         Ok(bars)
+    }
+
+    fn write_bar_to_device(
+        &self,
+        bar_id: u32,
+        bar_addr: u64,
+        region_type: PciBarRegionType,
+        flags: u32,
+    ) {
+        let (bar_offset, flag_bits) = if bar_id == VFIO_PCI_ROM_REGION_INDEX {
+            ((PCI_ROM_EXP_BAR_INDEX * 4) as u32, flags & 0x1)
+        } else if region_type == PciBarRegionType::IoRegion {
+            (PCI_CONFIG_BAR_OFFSET + bar_id * 4, flags & 0b11)
+        } else {
+            (PCI_CONFIG_BAR_OFFSET + bar_id * 4, flags & 0b1111)
+        };
+        self.vfio_wrapper
+            .write_config_dword(bar_offset, (bar_addr as u32) | flag_bits);
+        if region_type == PciBarRegionType::Memory64BitRegion {
+            self.vfio_wrapper
+                .write_config_dword(bar_offset + 4, (bar_addr >> 32) as u32);
+        }
     }
 
     pub(crate) fn free_bars(
@@ -1768,14 +1796,15 @@ impl VfioCommon {
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
         // When the guest wants to write to a BAR, we trap it into
-        // our local configuration space. We're not reprogramming
-        // VFIO device.
+        // our local configuration space, and the guest reads BARs back
+        // from there (see read_config_register()). The write also goes to
+        // the device, as QEMU does: vfio-pci ignores it, while a vendor
+        // driver that emulates the config space needs the guest's BAR base.
         if (PCI_CONFIG_BAR0_INDEX..PCI_CONFIG_BAR0_INDEX + BAR_NUMS).contains(&reg_idx)
             || reg_idx == PCI_ROM_EXP_BAR_INDEX
         {
-            // We keep our local cache updated with the BARs.
-            // We'll read it back from there when the guest is asking
-            // for BARs (see read_config_register()).
+            let reg = (reg_idx * PCI_CONFIG_REGISTER_SIZE) as u64;
+            self.vfio_wrapper.write_config((reg + offset) as u32, data);
             return (
                 self.configuration
                     .write_config_register(reg_idx, offset, data),
@@ -3759,6 +3788,36 @@ mod tests {
             let start = offset as usize;
             space[start..start + data.len()].copy_from_slice(data);
         }
+    }
+
+    #[test]
+    fn bar_writes_reach_the_device() {
+        let mock = MockConfigSpace::new(&[]);
+        let mut common = test_vfio_common(Arc::clone(&mock), None);
+
+        // A guest write to BAR0 updates the shadow and the device.
+        common.write_config_register(PCI_CONFIG_BAR0_INDEX, 0, &0xc000_0000u32.to_le_bytes());
+        assert_eq!(mock.dword(PCI_CONFIG_BAR_OFFSET), 0xc000_0000);
+
+        // An allocated 64-bit BAR is written over both registers, keeping
+        // the device's flag bits.
+        common.write_bar_to_device(
+            2,
+            0x0000_0cb4_0000_0000,
+            PciBarRegionType::Memory64BitRegion,
+            0xffff_fffc,
+        );
+        assert_eq!(mock.dword(PCI_CONFIG_BAR_OFFSET + 8), 0x0000_000c);
+        assert_eq!(mock.dword(PCI_CONFIG_BAR_OFFSET + 12), 0x0000_0cb4);
+
+        // The ROM BAR keeps only its enable bit.
+        common.write_bar_to_device(
+            VFIO_PCI_ROM_REGION_INDEX,
+            0xfe00_0000,
+            PciBarRegionType::Memory32BitRegion,
+            0x0000_0001,
+        );
+        assert_eq!(mock.dword((PCI_ROM_EXP_BAR_INDEX * 4) as u32), 0xfe00_0001);
     }
 
     #[test]
